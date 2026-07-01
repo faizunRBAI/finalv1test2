@@ -1,0 +1,217 @@
+---
+- name: Deploy FastAPI app to EC2
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    app_dir: /opt/app
+    venv_dir: /opt/app/.venv
+    app_user: ubuntu
+    python_bin: /usr/bin/python3.11
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install system packages
+      apt:
+        name:
+          - python3.11
+          - python3.11-venv
+          - python3.11-dev
+          - python3-pip
+          - nginx
+          - git
+          - curl
+          - build-essential
+        state: present
+
+    - name: Create app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0755"
+
+    - name: Synchronize application source
+      synchronize:
+        src: "{{ playbook_dir }}/../"
+        dest: "{{ app_dir }}/"
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=.github"
+          - "--exclude=terraform"
+          - "--exclude=ansible"
+          - "--exclude=__pycache__"
+          - "--exclude=*.pyc"
+          - "--exclude=.venv"
+          - "--exclude=.env"
+        delete: yes
+      become: false
+
+    - name: Fix ownership of app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        recurse: yes
+
+    - name: Create Python 3.11 virtualenv
+      command: "{{ python_bin }} -m venv {{ venv_dir }}"
+      args:
+        creates: "{{ venv_dir }}/bin/activate"
+      become_user: "{{ app_user }}"
+
+    - name: Upgrade pip in virtualenv
+      command: "{{ venv_dir }}/bin/pip install --upgrade pip"
+      become_user: "{{ app_user }}"
+
+    - name: Check if requirements.txt exists
+      stat:
+        path: "{{ app_dir }}/requirements.txt"
+      register: requirements_file
+
+    - name: Install Python dependencies from requirements.txt
+      command: "{{ venv_dir }}/bin/pip install -r {{ app_dir }}/requirements.txt"
+      become_user: "{{ app_user }}"
+      when: requirements_file.stat.exists
+
+    - name: Install core Python packages (fastapi, gunicorn, uvicorn)
+      command: "{{ venv_dir }}/bin/pip install fastapi uvicorn[standard] gunicorn python-multipart aiofiles"
+      become_user: "{{ app_user }}"
+
+    - name: Write .env file
+      shell: |
+        cat > {{ app_dir }}/.env << 'ENVEOF'
+        APP_ENV=production
+        PORT=8000
+        HOST=127.0.0.1
+        ENVEOF
+      args:
+        executable: /bin/bash
+
+    - name: Fix .env ownership
+      file:
+        path: "{{ app_dir }}/.env"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0640"
+
+    - name: Create systemd service for gunicorn
+      copy:
+        dest: /etc/systemd/system/app.service
+        content: |
+          [Unit]
+          Description=FastAPI App (gunicorn + uvicorn)
+          After=network.target
+
+          [Service]
+          User={{ app_user }}
+          Group={{ app_user }}
+          WorkingDirectory={{ app_dir }}
+          EnvironmentFile={{ app_dir }}/.env
+          ExecStart={{ venv_dir }}/bin/gunicorn app.main:app -k uvicorn.workers.UvicornWorker -w 4 -b 127.0.0.1:8000
+          ExecReload=/bin/kill -s HUP $MAINPID
+          KillMode=mixed
+          TimeoutStopSec=5
+          PrivateTmp=true
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start app service
+      systemd:
+        name: app
+        enabled: yes
+        state: restarted
+
+    - name: Wait for gunicorn to be ready
+      wait_for:
+        host: 127.0.0.1
+        port: 8000
+        delay: 3
+        timeout: 60
+
+    - name: Remove default nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Write nginx site config
+      copy:
+        dest: /etc/nginx/sites-available/app
+        content: |
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+              server_name _;
+
+              access_log /var/log/nginx/app_access.log;
+              error_log  /var/log/nginx/app_error.log;
+
+              client_max_body_size 50M;
+
+              location / {
+                  proxy_pass         http://127.0.0.1:8000;
+                  proxy_http_version 1.1;
+                  proxy_set_header   Upgrade $http_upgrade;
+                  proxy_set_header   Connection "upgrade";
+                  proxy_set_header   Host $host;
+                  proxy_set_header   X-Real-IP $remote_addr;
+                  proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header   X-Forwarded-Proto $scheme;
+                  proxy_read_timeout 300s;
+                  proxy_connect_timeout 75s;
+              }
+          }
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Enable nginx site
+      file:
+        src: /etc/nginx/sites-available/app
+        dest: /etc/nginx/sites-enabled/app
+        state: link
+
+    - name: Test nginx configuration
+      command: nginx -t
+      changed_when: false
+
+    - name: Enable and restart nginx
+      systemd:
+        name: nginx
+        enabled: yes
+        state: restarted
+
+    - name: Wait for nginx to be ready on port 80
+      wait_for:
+        host: 0.0.0.0
+        port: 80
+        delay: 2
+        timeout: 30
+
+    - name: Verify app health locally
+      uri:
+        url: http://127.0.0.1:8000/health
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: health_result
+      retries: 5
+      delay: 5
+      until: health_result.status == 200
